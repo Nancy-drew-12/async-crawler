@@ -2,6 +2,7 @@ import asyncio
 import logging 
 
 import aiohttp
+from src.html_parser import HTMLParser
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,7 @@ class AsyncCrawler:
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._session = None
         self.errors = {}
+        self._parser = HTMLParser()
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -63,3 +65,12 @@ class AsyncCrawler:
         unique = list(dict.fromkeys(urls))
         bodies = await asyncio.gather(*(self.fetch_url(u) for u in unique))
         return {u: body for u, body in zip(unique, bodies) if body is not None}
+    
+    async def fetch_and_parse(self, url: str) -> dict:
+        html = await self.fetch_url(url)
+        if html is None:
+            result = await self._parser.parse_html("", url)
+            result["errors"].append(
+                f"загрузка: {self.errors.get(url, 'неизвестная ошибка')}")
+            return result
+        return await self._parser.parse_html(html, url)
