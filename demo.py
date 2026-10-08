@@ -10,44 +10,49 @@ logging.basicConfig(level=logging.WARNING,
 URLS = [
     "https://example.com",
     "https://www.python.org",
-    "https://en.wikipedia.org/wiki/Web_crawler",
-    "https://docs.python.org/3/library/asyncio.html",
     "https://httpbin.org/html",
+    "https://httpbin.org/delay/1",
+    "https://httpbin.org/delay/2",
+    "https://httpbin.org/delay/3",
     "https://httpbin.org/status/404",
 ]
+assert len(set(URLS)) == len(URLS), "в URLS не должно быть повторов"
 
 
-def summary(page: dict) -> dict:
-    return {
-        "url": page["url"],
-        "title": page["title"],
-        "text_length": len(page["text"]),
-        "links_count": len(page["links"]),
-        "images_count": len(page["images"]),
-        "tables_count": len(page["tables"]),
-        "errors": page["errors"],
-    }
+async def sequential(urls):
+    crawler = AsyncCrawler()
+    start = time.perf_counter()
+    results = {}
+    for url in urls:
+        body = await crawler.fetch_url(url)
+        if body is not None:
+            results[url] = body
+    elapsed = time.perf_counter() - start
+    errors = dict(crawler.errors)
+    await crawler.close()
+    return elapsed, results, errors
+
+
+async def parallel(urls):
+    crawler = AsyncCrawler(max_concurrent=10)
+    start = time.perf_counter()
+    results = await crawler.fetch_urls(urls)
+    elapsed = time.perf_counter() - start
+    errors = dict(crawler.errors)
+    await crawler.close()
+    return elapsed, results, errors
 
 
 async def main():
-    crawler = AsyncCrawler(max_concurrent=5)
-    start = time.perf_counter()
-    pages = await asyncio.gather(*(crawler.fetch_and_parse(u) for u in URLS))
-    await crawler.close()
-    total = time.perf_counter() - start
+    print(f"Адресов: {len(URLS)} (все уникальные), один и тот же набор для обоих вариантов\n")
 
-    for page in pages:
-        print("-" * 60)
-        for key, value in summary(page).items():
-            print(f"{key:>13}: {value}")
-        for link in page["links"][:3]:
-            print(f"{'ссылка':>13}: {link}")
+    t_seq, res_seq, err_seq = await sequential(URLS)
+    t_par, res_par, err_par = await parallel(URLS)
 
-    ok = [p for p in pages if not p["errors"]]
-    print("=" * 60)
-    print(f"Страниц: {len(pages)}, без ошибок: {len(ok)}, за {total:.2f} с")
-    print(f"Всего ссылок: {sum(len(p['links']) for p in pages)}, "
-          f"всего символов текста: {sum(len(p['text']) for p in pages)}")
+    print(f"Последовательно: {t_seq:5.2f} с | загружено {len(res_seq)}, ошибок {len(err_seq)}")
+    print(f"Параллельно:     {t_par:5.2f} с | загружено {len(res_par)}, ошибок {len(err_par)}")
+    print(f"Ускорение: в {t_seq / t_par:.1f} раза")
+    print("Ошибки:", err_par)
 
 
 asyncio.run(main())
