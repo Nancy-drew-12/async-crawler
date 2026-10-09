@@ -4,10 +4,14 @@ import time
 
 import aiohttp
 
+from src.circuit_breaker import CircuitBreaker
 from src.crawler_queue import CrawlerQueue
+from src.errors import (CrawlerError, NetworkError, ParseError, PermanentError, TransientError,
+                        classify_exception, classify_status)
 from src.html_parser import HTMLParser
-from src.politeness import RETRY_STATUSES, UserAgentRotator, backoff_delay, parse_retry_after
+from src.politeness import UserAgentRotator, parse_retry_after
 from src.rate_limiter import RateLimiter
+from src.retry import RetryStrategy
 from src.robots_parser import RobotsParser
 from src.semaphore_manager import SemaphoreManager
 from src.url_filter import URLFilter, normalize_domain, normalize_url
@@ -32,7 +36,9 @@ class AsyncCrawler:
                  requests_per_second: float | None = None, rate_per_domain: bool = True,
                  min_delay: float = 0.0, jitter: float = 0.0,
                  respect_robots: bool = False, user_agents: list[str] | None = None,
-                 max_retries: int = 2, backoff_base: float = 1.0, backoff_max: float = 30.0):
+                 max_retries: int = 2, backoff_base: float = 1.0, backoff_max: float = 30.0,
+                 total_timeout: float | None = None, retry_strategy: RetryStrategy | None = None,
+                 circuit_breaker: CircuitBreaker | None = None):
         if isinstance(max_concurrent, bool) or not isinstance(max_concurrent, int) or max_concurrent < 1:
             raise ValueError("max_concurrent должен быть целым числом не меньше 1")
         for name, value in (("connect_timeout", connect_timeout), ("read_timeout", read_timeout)):
@@ -41,8 +47,11 @@ class AsyncCrawler:
 
         self.max_concurrent = max_concurrent
         self.user_agent = user_agent
-        # total=None: общего лимита нет, но подключение и ожидание данных ограничены
-        self.timeout = aiohttp.ClientTimeout(total=None, connect=connect_timeout, sock_read=read_timeout)
+        if total_timeout is not None and (isinstance(total_timeout, bool)
+                                          or not isinstance(total_timeout, (int, float)) or total_timeout <= 0):
+            raise ValueError("total_timeout должен быть положительным числом или None")
+        # total_timeout=None: общего лимита нет, но подключение и ожидание данных ограничены
+        self.timeout = aiohttp.ClientTimeout(total=total_timeout, connect=connect_timeout, sock_read=read_timeout)
         self._headers = {"User-Agent": user_agent}
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._session = None   # создаётся при первом запросе (уже внутри работающего цикла событий)
@@ -77,10 +86,20 @@ class AsyncCrawler:
         self.respect_robots = bool(respect_robots)
         self.robots = RobotsParser(fetch_agent=user_agent)
         self._rotator = UserAgentRotator(user_agents or [user_agent])
-        self.max_retries = max_retries
-        self.backoff_base = backoff_base
-        self.backoff_max = backoff_max
-        self.retries_done = 0          # сколько раз повторяли запрос после ошибки
+
+        # --- День 5: ошибки и повторы ---
+        # без своей стратегии создаём обычную из параметров max_retries, backoff_base, backoff_max
+        self.retry_strategy = retry_strategy or RetryStrategy(
+            max_retries=max_retries, base_delay=backoff_base, max_delay=backoff_max)
+        if self.retry_strategy.on_retry is None:
+            self.retry_strategy.on_retry = self._on_retry
+        self.circuit_breaker = circuit_breaker      # None = предохранитель выключен
+        self.error_details = {}                     # url -> ошибка (тип, статус, текст)
+
+    @property
+    def retries_done(self) -> int:
+        """Сколько раз запрос повторяли после ошибки."""
+        return self.retry_strategy.get_stats()["retries"]
 
     # ---------- сессия ----------
 
@@ -111,10 +130,10 @@ class AsyncCrawler:
     async def fetch_url(self, url: str) -> str | None:
         """Загружает одну страницу и возвращает её текст.
 
-        Перед запросом: проверка robots.txt (если включена) и ожидание своей очереди в RateLimiter.
-        При временных ошибках (таймаут, 429, 5xx) запрос повторяется с нарастающей паузой.
-        При неудаче не падает: пишет предупреждение в лог, сохраняет причину в self.errors[url]
-        и возвращает None.
+        Перед запросом: проверка robots.txt (если включена). Сам запрос идёт через RetryStrategy:
+        при временных и сетевых ошибках он повторяется с нарастающей паузой, при постоянных (404, 403)
+        сразу заканчивается. При неудаче не падает: пишет предупреждение в лог, сохраняет ошибку
+        в self.errors[url] (текст) и self.error_details[url] (объект) и возвращает None.
         """
         session = self._get_session()
         domain = SemaphoreManager.get_domain(url)
@@ -123,52 +142,78 @@ class AsyncCrawler:
             if self.respect_robots:
                 await self.robots.fetch_robots(url, session)
                 if not self.robots.can_fetch(url, user_agent):
-                    return self._fail(url, "Запрещено robots.txt")
+                    return self._fail(url, PermanentError("Запрещено robots.txt", url))
                 # Crawl-delay из robots.txt превращается в минимальную паузу для этого сайта
                 self._rate_limiter.set_domain_delay(domain, self.robots.get_crawl_delay(user_agent, url))
 
             logger.info("Начало загрузки: %s", url)
             started = time.perf_counter()
-            for attempt in range(self.max_retries + 1):
-                await self._rate_limiter.acquire(domain)
-                text, error, retryable, retry_after = await self._request_once(session, url, user_agent)
-                if error is None:
-                    break
-                if not retryable or attempt == self.max_retries:
-                    return self._fail(url, error)
-                # временная ошибка: ждём (сколько просит сайт или по backoff) и пробуем снова
-                pause = retry_after if retry_after is not None else backoff_delay(attempt, base=self.backoff_base)
-                pause = min(pause, self.backoff_max)
-                self.retries_done += 1
-                logger.warning("Повтор %d из %d для %s через %.1f с (%s)",
-                               attempt + 1, self.max_retries, url, pause, error)
-                # сайт просит притормозить: откладываем все запросы к нему, а не только этот;
-                # само ожидание произойдёт в acquire() на следующем круге
-                self._rate_limiter.delay_domain(domain, pause)
+            attempts = {"count": 0}               # номер попытки нужен, чтобы увеличивать таймауты
+            try:
+                text = await self.retry_strategy.execute_with_retry(
+                    self._fetch_attempt, url, domain, user_agent, attempts)
+            except CrawlerError as error:
+                return self._fail(url, error)
 
         self.errors.pop(url, None)
+        self.error_details.pop(url, None)
         logger.info("Успешно: %s (%d символов, %.2f с)", url, len(text), time.perf_counter() - started)
         return text
 
-    async def _request_once(self, session, url: str, user_agent: str):
-        """Один запрос. Возвращает (текст, ошибка, можно_ли_повторить, retry_after)."""
+    async def _fetch_attempt(self, url: str, domain: str, user_agent: str, attempts: dict) -> str:
+        """Одна попытка загрузки. При неудаче выбрасывает ошибку нужного типа (TransientError и т.п.)."""
+        attempt = attempts["count"]
+        attempts["count"] += 1
+        if self.circuit_breaker is not None:
+            self.circuit_breaker.allow(domain)          # домен заблокирован: сразу CircuitOpenError
+        logger.info("Попытка %d: %s", attempt + 1, url)
         try:
-            async with session.get(url, headers={"User-Agent": user_agent}) as response:
+            await self._rate_limiter.acquire(domain)
+            # с каждой попыткой таймауты растут: медленному сайту даём больше времени
+            base, rs = self.timeout, self.retry_strategy
+            timeout = aiohttp.ClientTimeout(
+                total=None if base.total is None else rs.timeout_for(attempt, base.total),
+                connect=rs.timeout_for(attempt, base.connect),
+                sock_read=rs.timeout_for(attempt, base.sock_read))
+            session = self._get_session()
+            async with session.get(url, headers={"User-Agent": user_agent}, timeout=timeout) as response:
                 if response.status >= 400:
-                    error = f"ClientResponseError: HTTP {response.status} {response.reason}"
                     retry_after = parse_retry_after(response.headers.get("Retry-After"))
-                    return None, error, response.status in RETRY_STATUSES, retry_after
-                return await response.text(errors="replace"), None, False, None
-        except asyncio.TimeoutError as e:                    # таймаут: ждём и пробуем снова
-            return None, f"{type(e).__name__}: превышено время ожидания", True, None
-        except aiohttp.ClientError as e:                     # остальные сетевые ошибки
-            # неверный адрес и ошибки сертификата повторять бессмысленно
-            retryable = not isinstance(e, (aiohttp.InvalidURL, aiohttp.ClientSSLError))
-            return None, f"{type(e).__name__}: {e}", retryable, None
+                    raise classify_status(response.status, url, response.reason, retry_after)
+                text = await response.text(errors="replace")
+        except asyncio.CancelledError:
+            if self.circuit_breaker is not None:
+                self.circuit_breaker.release(domain)
+            raise
+        except Exception as exc:
+            error = classify_exception(exc, url)
+            self._note_outcome(domain, error)
+            if error is exc:
+                raise
+            raise error from exc
+        self._note_outcome(domain, None)
+        return text
 
-    def _fail(self, url: str, reason: str) -> None:
-        self.errors[url] = reason
-        logger.warning("Ошибка загрузки %s -> %s", url, reason)
+    def _note_outcome(self, domain: str, error: CrawlerError | None) -> None:
+        """Сообщает предохранителю, как закончился запрос."""
+        if self.circuit_breaker is None:
+            return
+        if error is None or (isinstance(error, PermanentError) and error.status is not None):
+            self.circuit_breaker.record_success(domain)      # сайт ответил (даже 404 значит «сайт жив»)
+        elif isinstance(error, (TransientError, NetworkError)):
+            self.circuit_breaker.record_failure(domain)      # сайт перегружен или недоступен
+        else:
+            self.circuit_breaker.release(domain)
+
+    def _on_retry(self, error: CrawlerError, delay: float, retry_number: int) -> None:
+        """Вызывается перед повтором. Если сайт просит притормозить (429, 503), откладываем все запросы к нему."""
+        if error.url and error.status in (429, 503):
+            self._rate_limiter.delay_domain(SemaphoreManager.get_domain(error.url), delay)
+
+    def _fail(self, url: str, error: CrawlerError) -> None:
+        self.errors[url] = str(error)
+        self.error_details[url] = error
+        logger.warning("Ошибка загрузки %s -> %s", url, error)
         return None
 
     async def fetch_urls(self, urls: list[str]) -> dict[str, str]:
@@ -189,7 +234,13 @@ class AsyncCrawler:
             result = await self._parser.parse_html("", url)
             result["errors"].append(f"загрузка: {self.errors.get(url, 'неизвестная ошибка')}")
             return result
-        return await self._parser.parse_html(html, url)
+        try:
+            return await self._parser.parse_html(html, url)
+        except Exception as exc:                  # страница загрузилась, но разобрать её не удалось
+            error = ParseError(f"{type(exc).__name__}: {exc}", url)
+            self._fail(url, error)
+            return {"url": url, "title": "", "text": "", "links": [], "metadata": {}, "images": [],
+                    "headings": [], "tables": [], "lists": [], "errors": [str(error)]}
 
     # ---------- обход сайта ----------
 
@@ -312,3 +363,51 @@ class AsyncCrawler:
         stats["blocked_by_robots"] = self.robots.blocked_count
         stats["retries"] = self.retries_done
         return stats
+
+    def get_error_stats(self) -> dict:
+        """Сводка по ошибкам: по типам, повторы, список адресов с ошибками, состояние предохранителя."""
+        stats = self.retry_strategy.get_stats()
+        failed = {}
+        for url, error in self.error_details.items():
+            failed[url] = {"type": error.kind, "status": error.status, "message": str(error)}
+        stats["failed_urls"] = failed
+        stats["failed_count"] = len(failed)
+        if self.circuit_breaker is not None:
+            stats["circuit_breaker"] = self.circuit_breaker.get_stats()
+        return stats
+
+    def format_error_report(self) -> str:
+        """Текст отчёта об ошибках, который можно показать на экране или сохранить в файл."""
+        stats = self.get_error_stats()
+        lines = ["ОТЧЁТ ОБ ОШИБКАХ", "=" * 40]
+        lines.append(f"Запросов выполнено: {stats['calls']}")
+        lines.append(f"Ошибок всего (считая каждую попытку): {stats['total_errors']}")
+        for kind, count in sorted(stats["errors_by_type"].items()):
+            lines.append(f"  {kind}: {count}")
+        lines.append(f"Повторов: {stats['retries']}")
+        lines.append(f"Повторов, после которых запрос удался: {stats['successful_retries']}")
+        lines.append(f"Запросов, которые не удались даже после повторов: {stats['failed_after_retries']}")
+        lines.append(f"Среднее ожидание перед повтором: {stats['avg_retry_delay']:.2f} с")
+        lines.append("")
+        lines.append(f"Адреса с постоянными ошибками ({len(stats['permanent_urls'])}):")
+        for url in stats["permanent_urls"] or ["нет"]:
+            lines.append(f"  {url}")
+        lines.append("")
+        lines.append(f"Все адреса, которые не удалось загрузить ({stats['failed_count']}):")
+        for url, info in stats["failed_urls"].items():
+            lines.append(f"  {url} -> {info['message']}")
+        if not stats["failed_urls"]:
+            lines.append("  нет")
+        breaker = stats.get("circuit_breaker")
+        if breaker:
+            lines.append("")
+            lines.append(f"Предохранитель: блокировок {breaker['opened_total']}, отклонено запросов {breaker['rejected']}")
+            for domain, info in breaker["domains"].items():
+                lines.append(f"  {domain}: {info['state']}, доля ошибок {info['failure_rate']:.0%}")
+        return "\n".join(lines) + "\n"
+
+    def save_error_report(self, path: str = "error_report.txt") -> str:
+        """Сохраняет отчёт об ошибках в файл и возвращает путь."""
+        with open(path, "w", encoding="utf-8") as file:
+            file.write(self.format_error_report())
+        return path
