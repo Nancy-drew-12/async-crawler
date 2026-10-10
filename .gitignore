@@ -1,3 +1,10 @@
 __pycache__/
 *.pyc
 output/
+
+# результаты работы краулера
+demo_output/
+*.db
+*.db-wal
+*.db-shm
+error_report.txt

@@ -14,6 +14,7 @@ from src.rate_limiter import RateLimiter
 from src.retry import RetryStrategy
 from src.robots_parser import RobotsParser
 from src.semaphore_manager import SemaphoreManager
+from src.storage import DataStorage, StorageError, make_record
 from src.url_filter import URLFilter, normalize_domain, normalize_url
 
 logger = logging.getLogger("crawler")
@@ -38,7 +39,9 @@ class AsyncCrawler:
                  respect_robots: bool = False, user_agents: list[str] | None = None,
                  max_retries: int = 2, backoff_base: float = 1.0, backoff_max: float = 30.0,
                  total_timeout: float | None = None, retry_strategy: RetryStrategy | None = None,
-                 circuit_breaker: CircuitBreaker | None = None):
+                 circuit_breaker: CircuitBreaker | None = None,
+                 storage: DataStorage | None = None, storage_retries: int = 3,
+                 storage_retry_delay: float = 0.2):
         if isinstance(max_concurrent, bool) or not isinstance(max_concurrent, int) or max_concurrent < 1:
             raise ValueError("max_concurrent должен быть целым числом не меньше 1")
         for name, value in (("connect_timeout", connect_timeout), ("read_timeout", read_timeout)):
@@ -96,6 +99,21 @@ class AsyncCrawler:
         self.circuit_breaker = circuit_breaker      # None = предохранитель выключен
         self.error_details = {}                     # url -> ошибка (тип, статус, текст)
 
+        # --- День 6: сохранение данных ---
+        if storage is not None and not isinstance(storage, DataStorage):
+            raise TypeError("storage должен быть объектом DataStorage (JSONStorage, CSVStorage, SQLiteStorage)")
+        if isinstance(storage_retries, bool) or not isinstance(storage_retries, int) or storage_retries < 0:
+            raise ValueError("storage_retries должен быть целым числом не меньше 0")
+        if isinstance(storage_retry_delay, bool) or not isinstance(storage_retry_delay, (int, float)) \
+                or storage_retry_delay < 0:
+            raise ValueError("storage_retry_delay должен быть числом не меньше 0")
+        self.storage = storage                      # None = данные никуда не сохраняются
+        self.storage_retries = storage_retries
+        self.storage_retry_delay = storage_retry_delay
+        self.storage_errors = {}                    # url -> ошибка сохранения
+        self._storage_stats = {"saved": 0, "failed": 0, "retries": 0}
+        self._response_meta = {}                    # url -> (код ответа, тип содержимого)
+
     @property
     def retries_done(self) -> int:
         """Сколько раз запрос повторяли после ошибки."""
@@ -117,6 +135,11 @@ class AsyncCrawler:
         if self._session is not None:
             await self._session.close()
             self._session = None
+        if self.storage is not None:                # дописываем буфер и закрываем файл или базу
+            try:
+                await self.storage.close()
+            except StorageError as error:
+                logger.error("Не удалось закрыть хранилище: %s", error)
         self._closed = True
 
     async def __aenter__(self):
@@ -181,6 +204,8 @@ class AsyncCrawler:
                     retry_after = parse_retry_after(response.headers.get("Retry-After"))
                     raise classify_status(response.status, url, response.reason, retry_after)
                 text = await response.text(errors="replace")
+                if self.storage is not None:        # код ответа и тип содержимого нужны для записи в хранилище
+                    self._response_meta[url] = (response.status, response.content_type)
         except asyncio.CancelledError:
             if self.circuit_breaker is not None:
                 self.circuit_breaker.release(domain)
@@ -258,6 +283,7 @@ class AsyncCrawler:
         self.visited_urls = set()
         self.failed_urls = {}
         self.processed_urls = {}
+        self.storage_errors = {}
         self.queue = CrawlerQueue()
         self._depths = {}                    # url -> на каком шаге от старта найден
         self._max_pages = max_pages
@@ -276,6 +302,7 @@ class AsyncCrawler:
         try:
             await asyncio.gather(*workers)
         finally:
+            await self._flush_storage()                             # всё, что в буфере, уходит на диск
             if reporter is not None:
                 reporter.cancel()                                   # останавливаем вывод прогресса
                 await asyncio.gather(reporter, return_exceptions=True)
@@ -293,7 +320,8 @@ class AsyncCrawler:
         p = self.get_politeness_stats()
         return (f"[{s['elapsed']:5.1f} с] обработано: {s['processed']} | в очереди: {s['queued']} | "
                 f"в работе: {s['in_progress']} | ошибок: {s['failed']} | {s['pages_per_sec']:.1f} стр/с | "
-                f"запросов/с: {p['current_rps']:.1f} | пауза: {p['avg_delay']:.2f} с | robots: {p['blocked_by_robots']}")
+                f"запросов/с: {p['current_rps']:.1f} | пауза: {p['avg_delay']:.2f} с | robots: {p['blocked_by_robots']}"
+                + (f" | сохранено: {self._storage_stats['saved']}" if self.storage is not None else ""))
 
     def _enqueue(self, url, depth: int) -> bool:
         """Кладёт ссылку в очередь, если она проходит все проверки."""
@@ -331,6 +359,61 @@ class AsyncCrawler:
             if depth < self.max_depth:       # глубже max_depth ссылки не собираем
                 for link in page.get("links", []):
                     self._enqueue(self._link_url(link), depth + 1)
+
+            await self._save_page(url, page)   # после ссылок: другие рабочие уже могут брать новые адреса
+
+    # ---------- сохранение данных ----------
+
+    async def _save_page(self, url: str, page: dict) -> None:
+        """Сохраняет страницу в хранилище. При сбое записи повторяет с нарастающей паузой.
+        Никогда не роняет обход: если сохранить не удалось, ошибка логируется и запоминается."""
+        if self.storage is None:
+            return
+        status, content_type = self._response_meta.pop(url, (None, ""))
+        try:
+            record = make_record({**page, "url": page.get("url") or url},
+                                 status_code=status, content_type=content_type)
+        except ValueError as error:
+            self._storage_failed(url, error)
+            return
+        delay = self.storage_retry_delay
+        for attempt in range(self.storage_retries + 1):
+            try:
+                await self.storage.save(record)
+            except (StorageError, OSError) as error:      # сбой записи: диск, база, блокировка
+                if attempt >= self.storage_retries:
+                    self._storage_failed(url, error, attempts=attempt + 1)
+                    return
+                self._storage_stats["retries"] += 1
+                logger.warning("Ошибка сохранения %s (попытка %d из %d): %s; повтор через %.1f с",
+                               url, attempt + 1, self.storage_retries + 1, error, delay)
+                await asyncio.sleep(delay)
+                delay *= 2
+            except Exception as error:                    # например, запись неверного формата: повтор не поможет
+                self._storage_failed(url, error)
+                return
+            else:
+                self._storage_stats["saved"] += 1
+                return
+
+    def _storage_failed(self, url: str, error: Exception, attempts: int = 1) -> None:
+        self.storage_errors[url] = f"{type(error).__name__}: {error}"
+        self._storage_stats["failed"] += 1
+        logger.error("Не удалось сохранить %s (попыток: %d): %s", url, attempts, error)
+
+    async def _flush_storage(self) -> None:
+        if self.storage is None:
+            return
+        try:
+            await self.storage.flush()
+        except StorageError as error:
+            logger.error("Не удалось дописать буфер хранилища: %s", error)
+
+    def get_storage_stats(self) -> dict:
+        """Сколько страниц сохранено, сколько не удалось, сколько было повторов записи."""
+        if self.storage is None:
+            return {}
+        return {**self._storage_stats, "errors": dict(self.storage_errors), "storage": self.storage.get_stats()}
 
     def _record_failure(self, url: str, reason: str) -> None:
         self.failed_urls[url] = reason
@@ -398,6 +481,11 @@ class AsyncCrawler:
             lines.append(f"  {url} -> {info['message']}")
         if not stats["failed_urls"]:
             lines.append("  нет")
+        if self.storage_errors:
+            lines.append("")
+            lines.append(f"Ошибки сохранения ({len(self.storage_errors)}):")
+            for url, message in self.storage_errors.items():
+                lines.append(f"  {url} -> {message}")
         breaker = stats.get("circuit_breaker")
         if breaker:
             lines.append("")
