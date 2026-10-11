@@ -41,7 +41,7 @@ class AsyncCrawler:
                  total_timeout: float | None = None, retry_strategy: RetryStrategy | None = None,
                  circuit_breaker: CircuitBreaker | None = None,
                  storage: DataStorage | None = None, storage_retries: int = 3,
-                 storage_retry_delay: float = 0.2):
+                 storage_retry_delay: float = 0.2, page_callback=None):
         if isinstance(max_concurrent, bool) or not isinstance(max_concurrent, int) or max_concurrent < 1:
             raise ValueError("max_concurrent должен быть целым числом не меньше 1")
         for name, value in (("connect_timeout", connect_timeout), ("read_timeout", read_timeout)):
@@ -113,6 +113,10 @@ class AsyncCrawler:
         self.storage_errors = {}                    # url -> ошибка сохранения
         self._storage_stats = {"saved": 0, "failed": 0, "retries": 0}
         self._response_meta = {}                    # url -> (код ответа, тип содержимого)
+
+        # --- День 7: сообщать о каждой обработанной странице ---
+        # page_callback(url, ok, status, error, size) вызывается один раз для каждой страницы
+        self.page_callback = page_callback
 
     @property
     def retries_done(self) -> int:
@@ -204,8 +208,7 @@ class AsyncCrawler:
                     retry_after = parse_retry_after(response.headers.get("Retry-After"))
                     raise classify_status(response.status, url, response.reason, retry_after)
                 text = await response.text(errors="replace")
-                if self.storage is not None:        # код ответа и тип содержимого нужны для записи в хранилище
-                    self._response_meta[url] = (response.status, response.content_type)
+                self._response_meta[url] = (response.status, response.content_type)   # нужно хранилищу и статистике
         except asyncio.CancelledError:
             if self.circuit_breaker is not None:
                 self.circuit_breaker.release(domain)
@@ -354,6 +357,10 @@ class AsyncCrawler:
 
             self.processed_urls[url] = page
             self.queue.mark_processed(url)
+            status = self._response_meta.get(url, (None, ""))[0]
+            self._emit_page(url, True, status, None, len(page.get("text") or ""))
+            if self.storage is None:
+                self._response_meta.pop(url, None)
 
             depth = self._depths[url]
             if depth < self.max_depth:       # глубже max_depth ссылки не собираем
@@ -418,6 +425,18 @@ class AsyncCrawler:
     def _record_failure(self, url: str, reason: str) -> None:
         self.failed_urls[url] = reason
         self.queue.mark_failed(url, reason)
+        details = self.error_details.get(url)
+        name = type(details).__name__ if details is not None else reason.split(":")[0]
+        self._emit_page(url, False, getattr(details, "status", None), name, 0)
+
+    def _emit_page(self, url, ok, status, error, size) -> None:
+        """Сообщает наружу (например, статистике) о результате по странице. Сбой в callback не ломает обход."""
+        if self.page_callback is None:
+            return
+        try:
+            self.page_callback(url, ok, status, error, size)
+        except Exception as exc:
+            logger.error("Ошибка в page_callback для %s: %s", url, exc)
 
     @staticmethod
     def _link_url(link):

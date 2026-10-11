@@ -1,5 +1,6 @@
 aiohttp
 aiofiles
-beautifulsoup4
-lxmlaiofiles
 aiosqlite
+beautifulsoup4
+lxml
+pyyaml

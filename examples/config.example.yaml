@@ -1,0 +1,29 @@
+# Пример настроек краулера. Всё, чего здесь нет, берётся по умолчанию.
+start_urls:
+  - https://example.com
+
+sitemaps: []          # например: https://example.com/sitemap.xml
+
+crawler:
+  max_pages: 100
+  max_depth: 2
+  max_concurrent: 10
+  rate_limit: 5       # запросов в секунду
+  respect_robots: true
+
+filters:
+  exclude_patterns:
+    - "\\.pdf$"
+    - "/login"
+
+storage:
+  type: json          # none / json / csv / sqlite
+  path: results.json
+
+logging:
+  file: crawler.log
+  level: INFO
+
+report:
+  json: stats.json
+  html: report.html

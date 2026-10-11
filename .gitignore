@@ -8,3 +8,6 @@ demo_output/
 *.db-wal
 *.db-shm
 error_report.txt
+
+crawler.log*
+*.log
