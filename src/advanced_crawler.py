@@ -9,7 +9,6 @@ from src.csv_storage import CSVStorage
 from src.json_storage import JSONStorage
 from src.log_setup import close_logging, setup_logging
 from src.monitor import ProgressMonitor
-from src.sitemap_parser import SitemapParser
 from src.sqlite_storage import SQLiteStorage
 
 logger = logging.getLogger("crawler")
@@ -113,7 +112,7 @@ class AdvancedCrawler:
         return self.results
 
     async def _urls_from_sitemaps(self):
-        parser = SitemapParser(user_agent=self.crawler.user_agent)
+        parser = self.crawler.create_sitemap_parser()      # те же правила вежливости, что и у страниц
         found = []
         for sitemap_url in self.config["sitemaps"]:
             urls = await parser.fetch_sitemap(sitemap_url)

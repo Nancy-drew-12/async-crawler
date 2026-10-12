@@ -15,6 +15,7 @@ from src.rate_limiter import RateLimiter
 from src.retry import RetryStrategy
 from src.robots_parser import RobotsParser
 from src.semaphore_manager import SemaphoreManager
+from src.sitemap_parser import SitemapParser
 from src.storage import DataStorage, StorageError, make_record
 from src.url_filter import URLFilter, normalize_domain, normalize_url
 
@@ -122,6 +123,14 @@ class AsyncCrawler:
         # --- День 7: сообщать о каждой обработанной странице ---
         # page_callback(url, ok, status, error, size) вызывается один раз для каждой страницы
         self.page_callback = page_callback
+
+    def create_sitemap_parser(self, **options) -> SitemapParser:
+        """Парсер sitemap, который работает по правилам этого краулера: общий пул соединений,
+        общая пауза между запросами, общие лимиты параллельности, robots.txt (если включён) и повторы."""
+        return SitemapParser(
+            user_agent=self.user_agent, session=self._get_session(), retry_strategy=self.retry_strategy,
+            rate_limiter=self._rate_limiter, limits=self._limits,
+            robots=self.robots if self.respect_robots else None, **options)
 
     @property
     def retries_done(self) -> int:

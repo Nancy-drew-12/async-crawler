@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, ROOT)
@@ -229,6 +230,85 @@ async def test_advanced(base):
     print("max_pages, фильтры и повторное закрытие работают")
 
 
+async def start_polite_site():
+    """Сайт, который записывает, когда и сколько запросов к sitemap пришло одновременно."""
+    log = {"times": [], "paths": [], "inflight": 0, "max_inflight": 0}
+
+    async def robots(request):
+        return web.Response(text="User-agent: *\nDisallow: /sitemaps/s1.xml\n")
+
+    async def index(request):
+        base = f"http://127.0.0.1:{request.url.port}"
+        return web.Response(text=sitemap_index(base, ["s1.xml", "s2.xml", "s3.xml", "s4.xml"]),
+                            content_type="application/xml")
+
+    async def child(request):
+        base = f"http://127.0.0.1:{request.url.port}"
+        log["times"].append(time.monotonic())
+        log["paths"].append(request.path)
+        log["inflight"] += 1
+        log["max_inflight"] = max(log["max_inflight"], log["inflight"])
+        try:
+            await asyncio.sleep(0.05)                   # пока «отвечаем», другие запросы могут прийти параллельно
+            number = request.match_info["n"]
+            return web.Response(text=urlset(base, [f"/page{number}"]), content_type="application/xml")
+        finally:
+            log["inflight"] -= 1
+
+    app = web.Application()
+    app.router.add_get("/robots.txt", robots)
+    app.router.add_get("/sitemaps/index.xml", index)
+    app.router.add_get("/sitemaps/s{n}.xml", child)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    return runner, site._server.sockets[0].getsockname()[1], log
+
+
+async def test_sitemap_politeness():
+    section("8. Sitemap соблюдает правила вежливости")
+    runner, port, log = await start_polite_site()
+    index_url = f"http://127.0.0.1:{port}/sitemaps/index.xml"
+    try:
+        # без правил четыре вложенных sitemap грузятся одновременно (так вёл себя старый код)
+        plain = SitemapParser(max_concurrent=5)
+        assert len(await plain.fetch_sitemap(index_url)) == 4
+        assert log["max_inflight"] > 1, "контрольный запуск должен показать параллельные запросы"
+        print("Без правил вежливости запросов одновременно:", log["max_inflight"])
+
+        # через AdvancedCrawler: лимит скорости и не больше одного запроса к сайту одновременно
+        log.update(times=[], paths=[], inflight=0, max_inflight=0)
+        config = {"sitemaps": [index_url], "logging": {"file": None},
+                  "crawler": {"rate_limit": 10, "max_per_domain": 1, "max_retries": 0}}
+        crawler = AdvancedCrawler(config)
+        try:
+            urls = await crawler._urls_from_sitemaps()
+        finally:
+            await crawler.close()
+        gaps = [b - a for a, b in zip(log["times"], log["times"][1:])]
+        print(f"С правилами: адресов {len(urls)}, одновременно {log['max_inflight']}, "
+              f"минимальная пауза {min(gaps):.2f} с (лимит 10 запросов/с)")
+        assert len(urls) == 4
+        assert log["max_inflight"] == 1, "лимит max_per_domain должен действовать и на sitemap"
+        assert min(gaps) >= 0.07, "между запросами к sitemap должна быть пауза по rate_limit"
+
+        # robots.txt запрещает s1.xml: файл не загружается
+        log.update(times=[], paths=[], inflight=0, max_inflight=0)
+        crawler = AdvancedCrawler({"sitemaps": [index_url], "logging": {"file": None},
+                                   "crawler": {"respect_robots": True, "max_retries": 0}})
+        try:
+            parser = crawler.crawler.create_sitemap_parser()
+            urls = await parser.fetch_sitemap(index_url)
+        finally:
+            await crawler.close()
+        assert len(urls) == 3 and "/sitemaps/s1.xml" not in log["paths"], (urls, log["paths"])
+        assert any("robots" in reason.lower() for reason in parser.errors.values()), parser.errors
+        print("robots.txt запретил s1.xml: загружено 3 адреса из 4, запрещённый файл не запрашивался")
+    finally:
+        await runner.cleanup()
+
+
 def run_cli(args):
     return subprocess.run([sys.executable, "crawler.py", *args], capture_output=True, text=True, cwd=ROOT)
 
@@ -261,6 +341,7 @@ async def main():
         test_monitor()
         await test_advanced(base)
         await test_cli(base)
+        await test_sitemap_politeness()
     finally:
         await runner.cleanup()
         shutil.rmtree(TMP, ignore_errors=True)

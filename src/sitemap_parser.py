@@ -1,5 +1,6 @@
 """Чтение sitemap.xml: обычных, индексных (sitemap со ссылками на другие sitemap) и сжатых (.xml.gz)."""
 import asyncio
+import contextlib
 import gzip
 import logging
 import xml.etree.ElementTree as ET
@@ -8,9 +9,11 @@ from urllib.parse import urljoin, urlsplit
 
 import aiohttp
 
-from src.errors import CrawlerError, classify_exception, classify_status
+from src.errors import CrawlerError, PermanentError, classify_exception, classify_status
+from src.rate_limiter import RateLimiter
 from src.retry import RetryStrategy
 from src.robots_parser import RobotsParser
+from src.semaphore_manager import SemaphoreManager
 
 logger = logging.getLogger("crawler")
 
@@ -33,11 +36,17 @@ class SitemapParser:
     Понимает три вида файлов: обычный (<urlset>), индексный (<sitemapindex>, он обрабатывается
     рекурсивно) и простой текстовый (один адрес на строку). Сжатые .xml.gz распаковываются сами.
     Сбой одного вложенного sitemap не останавливает остальные: причина попадает в self.errors.
+
+    Правила вежливости. Если передать компоненты краулера, sitemap загружается по тем же правилам, что и
+    страницы: session (общий пул соединений), rate_limiter (пауза между запросами к сайту), limits
+    (лимиты одновременных запросов на сайт и всего), robots (проверка robots.txt; None = не проверять).
+    Проще всего получить такой парсер через AsyncCrawler.create_sitemap_parser().
     """
 
     def __init__(self, user_agent: str = DEFAULT_USER_AGENT, timeout: float = 15.0, max_depth: int = 5,
                  max_urls: int = 100_000, max_concurrent: int = 5, retry_strategy: RetryStrategy | None = None,
-                 session: aiohttp.ClientSession | None = None):
+                 session: aiohttp.ClientSession | None = None, rate_limiter: RateLimiter | None = None,
+                 limits: SemaphoreManager | None = None, robots: RobotsParser | None = None):
         if isinstance(max_depth, bool) or not isinstance(max_depth, int) or max_depth < 0:
             raise ValueError("max_depth должен быть целым числом не меньше 0")
         if isinstance(max_urls, bool) or not isinstance(max_urls, int) or max_urls < 1:
@@ -51,6 +60,9 @@ class SitemapParser:
         self.max_concurrent = max_concurrent    # сколько вложенных sitemap грузить одновременно
         self.retry_strategy = retry_strategy or RetryStrategy(max_retries=2, base_delay=0.5)
         self._session = session                 # чужую сессию (из краулера) не закрываем
+        self.rate_limiter = rate_limiter        # пауза между запросами к одному сайту (общая с краулером)
+        self.limits = limits                    # лимиты параллельности (общие с краулером)
+        self.robots = robots                    # проверка robots.txt; None = не проверять
         self.errors: dict[str, str] = {}        # адрес sitemap -> причина неудачи
         self.sitemaps_fetched: list[str] = []   # какие sitemap удалось прочитать
 
@@ -81,7 +93,7 @@ class SitemapParser:
         own_session = self._session is None
         session = self._session or aiohttp.ClientSession(headers={"User-Agent": self.user_agent})
         try:
-            robots = robots or RobotsParser(fetch_agent=self.user_agent)
+            robots = robots or self.robots or RobotsParser(fetch_agent=self.user_agent)
             info = await robots.fetch_robots(origin, session)
         finally:
             if own_session:
@@ -103,7 +115,8 @@ class SitemapParser:
             return
         seen.add(sitemap_url)
         try:
-            async with gate:
+            async with gate, self._slot(sitemap_url):
+                await self._check_robots(session, sitemap_url)
                 data = await self.retry_strategy.execute_with_retry(self._download, session, url=sitemap_url)
             kind, locs = self._parse(data, sitemap_url)
         except CrawlerError as error:
@@ -123,8 +136,25 @@ class SitemapParser:
                     return
                 urls.setdefault(loc)
 
+    def _slot(self, url: str):
+        """Место в общих лимитах параллельности (если они заданы): не больше N запросов к одному сайту."""
+        return self.limits.acquire(url) if self.limits is not None else contextlib.nullcontext()
+
+    async def _check_robots(self, session, url: str) -> None:
+        """Если включена проверка robots.txt, запрещённый sitemap не загружается (как и запрещённая страница)."""
+        if self.robots is None:
+            return
+        await self.robots.fetch_robots(url, session)
+        if not self.robots.can_fetch(url, self.user_agent):
+            raise PermanentError("Запрещено robots.txt", url)
+        if self.rate_limiter is not None:       # Crawl-delay из robots.txt становится паузой для этого сайта
+            self.rate_limiter.set_domain_delay(SemaphoreManager.get_domain(url),
+                                               self.robots.get_crawl_delay(self.user_agent, url))
+
     async def _download(self, session, url: str) -> bytes:
         """Скачивает файл целиком (не больше лимита) и распаковывает его, если он сжат."""
+        if self.rate_limiter is not None:       # перед каждой попыткой, в том числе повторной
+            await self.rate_limiter.acquire(SemaphoreManager.get_domain(url))
         try:
             async with session.get(url, timeout=self.timeout) as response:
                 if response.status >= 400:

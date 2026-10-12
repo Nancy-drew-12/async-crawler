@@ -13,7 +13,8 @@
   паузой, учёт `Retry-After`, предохранитель (circuit breaker) для «упавших» сайтов.
 - **Хранение данных**: JSON (массив или JSON Lines), CSV, SQLite (с обновлением по `url`).
 - **Sitemap**: обычные и индексные `sitemap.xml`, сжатие gzip, защита от «XML-бомб»; адреса из
-  sitemap используются как источник для обхода.
+  sitemap используются как источник для обхода. Файлы sitemap загружаются по тем же правилам вежливости,
+  что и страницы: общий пул соединений, `rate_limit`, лимиты параллельности, `robots.txt`, повторы.
 - **Статистика и отчёты**: страницы, успехи и ошибки, коды ответов, топ доменов, скорость, время;
   экспорт в JSON и HTML (с таблицами и графиками).
 - **Конфигурация** из YAML или JSON, проверка значений с понятными ошибками.
@@ -167,7 +168,7 @@ report:
 |---|---|
 | `src/async_crawler.py` — `AsyncCrawler` | ядро: загрузка, обход, вежливость, повторы, сохранение |
 | `src/crawler_stats.py` — `CrawlerStats` | подсчёт статистики и экспорт в JSON/HTML |
-| `src/sitemap_parser.py` — `SitemapParser` | `await fetch_sitemap(url) -> list[str]`, `await fetch_for_site(site_url)` |
+| `src/sitemap_parser.py` — `SitemapParser` | `await fetch_sitemap(url) -> list[str]`, `await fetch_for_site(site_url)`; вежливый парсер с общими с краулером настройками даёт `AsyncCrawler.create_sitemap_parser()` |
 | `src/config.py` | `load_config(path)`, `from_dict(data)`, `ConfigError` |
 | `src/log_setup.py` | `setup_logging(...)`, `close_logging()` |
 | `src/monitor.py` | `ProgressMonitor`, `format_progress(...)` |
