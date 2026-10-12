@@ -127,7 +127,6 @@ class SQLiteStorage(DataStorage):
                 except StorageError:
                     self._buffer.pop()          # эта запись не сохранена: вызывающий может повторить
                     raise
-            self.saved_count += 1
 
     async def flush(self) -> None:
         async with self._lock:
@@ -146,6 +145,7 @@ class SQLiteStorage(DataStorage):
             except DB_ERRORS:
                 pass
             raise StorageError(f"не удалось записать в базу {self.path}: {error}") from error
+        self.saved_count += len(self._buffer)      # считаем только то, что реально записано
         self._buffer.clear()
         self.flushes += 1
 

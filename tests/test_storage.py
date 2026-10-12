@@ -375,6 +375,90 @@ async def test_crawler_integration(server, tmp):
     print("Неверные параметры отклоняются; без storage краулер работает как раньше")
 
 
+class BufferedStorage(DataStorage):
+    """Хранилище с буфером, у которого flush() сначала падает flush_failures раз. Имитирует сбой диска при записи."""
+
+    def __init__(self, flush_failures=0):
+        super().__init__()
+        self.buffer, self.written = [], []
+        self.flush_failures = flush_failures
+        self.flush_calls = 0
+
+    async def save(self, data):
+        validate_record(data)
+        self.buffer.append(dict(data))             # только в буфер, на диск пока не пишем
+
+    async def flush(self):
+        self.flush_calls += 1
+        if self.flush_failures > 0:
+            self.flush_failures -= 1
+            raise StorageError("имитация сбоя записи буфера")
+        self.written += self.buffer
+        self.saved_count += len(self.buffer)
+        self.buffer.clear()
+
+    async def close(self):
+        await self.flush()
+
+    def get_stats(self):
+        return {"saved": self.saved_count, "buffered": len(self.buffer)}
+
+
+async def test_flush_failures(server, tmp):
+    section("Сбои при записи буфера (замечание ментора)")
+
+    # 1. «сохранено» растёт только после реальной записи
+    storage = JSONStorage(os.path.join(tmp, "pending.json"), buffer_size=10)
+    async with AsyncCrawler(max_retries=0, storage=storage) as crawler:
+        for i in (1, 2):
+            await crawler._save_page(f"http://x.test/{i}", make_page(i))
+        stats = crawler.get_storage_stats()
+        assert (stats["saved"], stats["pending"], stats["storage"]["saved"]) == (0, 2, 0), stats
+        await crawler._flush_storage()
+        stats = crawler.get_storage_stats()
+        assert (stats["saved"], stats["pending"], stats["storage"]["saved"]) == (2, 0, 2), stats
+    print("Пока записи лежат в буфере, они не считаются сохранёнными; после flush() считаются")
+
+    # 2. flush() падает дважды, потом получается: повторы работают
+    storage = BufferedStorage(flush_failures=2)
+    async with AsyncCrawler(max_retries=0, max_depth=3, storage=storage, storage_retries=3,
+                            storage_retry_delay=0.01) as crawler:
+        await crawler.crawl([server.base + "/"], progress=False)
+        stats = crawler.get_storage_stats()
+    assert (stats["saved"], stats["failed"], stats["retries"], stats["pending"]) == (4, 0, 2, 0), stats
+    assert len(storage.written) == 4 and not stats["errors"]
+    print("flush() упал дважды и удался с третьей попытки: сохранено 4, повторов 2")
+
+    # 3. настоящий JSONStorage по недоступному пути (пример из замечания)
+    blocker = os.path.join(tmp, "blocker")
+    open(blocker, "w").close()                     # обычный файл, внутрь которого создать файл нельзя
+    storage = JSONStorage(os.path.join(blocker, "results.json"))
+    async with AsyncCrawler(max_retries=0, max_depth=3, storage=storage, storage_retries=2,
+                            storage_retry_delay=0.01) as crawler:
+        results = await crawler.crawl([server.base + "/"], progress=False)
+        stats = crawler.get_storage_stats()
+        report = crawler.format_error_report()
+    assert len(results) == 4
+    assert (stats["saved"], stats["failed"], stats["retries"], stats["pending"]) == (0, 4, 2, 0), stats
+    assert len(stats["errors"]) == 4 and stats["storage"]["saved"] == 0
+    assert "Ошибки сохранения (4)" in report
+    print("Файл не создан: сохранено 0, ошибок 4, повторов flush() 2, все адреса в отчёте")
+
+    # 4. flush() не удаётся при обходе, но получается при закрытии: статистика исправляется
+    storage = BufferedStorage(flush_failures=1000)
+    crawler = AsyncCrawler(max_retries=0, max_depth=3, storage=storage, storage_retries=1,
+                           storage_retry_delay=0.01)
+    await crawler.crawl([server.base + "/"], progress=False)
+    stats = crawler.get_storage_stats()
+    assert (stats["saved"], stats["failed"]) == (0, 4), stats
+    storage.flush_failures = 0                     # диск «починили»
+    await crawler.close()
+    stats = crawler.get_storage_stats()
+    assert (stats["saved"], stats["failed"], len(stats["errors"])) == (4, 0, 0), stats
+    assert len(storage.written) == 4
+    print("Буфер удалось записать при закрытии: статистика исправлена (сохранено 4, ошибок 0)")
+
+
 async def main():
     test_record_format()
     server = LocalServer()
@@ -388,6 +472,7 @@ async def main():
             await test_integrity(tmp)
             await test_errors(tmp)
             await test_crawler_integration(server, tmp)
+            await test_flush_failures(server, tmp)
     finally:
         await server.stop()
     print("\nВсе проверки пройдены")

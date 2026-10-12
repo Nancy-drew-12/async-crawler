@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+from collections import deque
 
 import aiohttp
 
@@ -112,6 +113,10 @@ class AsyncCrawler:
         self.storage_retry_delay = storage_retry_delay
         self.storage_errors = {}                    # url -> ошибка сохранения
         self._storage_stats = {"saved": 0, "failed": 0, "retries": 0}
+        # запись «сохранена» только после реальной записи на диск, а не когда попала в буфер:
+        self._pending_urls = deque()                # приняты хранилищем, но ещё лежат в буфере
+        self._lost_urls = []                        # буфер не удалось записать (см. _flush_failed)
+        self._confirmed_total = storage.saved_count if storage is not None else 0
         self._response_meta = {}                    # url -> (код ответа, тип содержимого)
 
         # --- День 7: сообщать о каждой обработанной странице ---
@@ -144,6 +149,9 @@ class AsyncCrawler:
                 await self.storage.close()
             except StorageError as error:
                 logger.error("Не удалось закрыть хранилище: %s", error)
+            else:
+                if self._lost_urls:
+                    self._recover_lost()
         self._closed = True
 
     async def __aenter__(self):
@@ -287,6 +295,10 @@ class AsyncCrawler:
         self.failed_urls = {}
         self.processed_urls = {}
         self.storage_errors = {}
+        self._pending_urls.clear()
+        self._lost_urls = []
+        if self.storage is not None:
+            self._confirmed_total = self.storage.saved_count
         self.queue = CrawlerQueue()
         self._depths = {}                    # url -> на каком шаге от старта найден
         self._max_pages = max_pages
@@ -400,7 +412,8 @@ class AsyncCrawler:
                 self._storage_failed(url, error)
                 return
             else:
-                self._storage_stats["saved"] += 1
+                self._pending_urls.append(url)      # принято в буфер; «сохранено» станет после записи
+                self._confirm_written()
                 return
 
     def _storage_failed(self, url: str, error: Exception, attempts: int = 1) -> None:
@@ -408,19 +421,65 @@ class AsyncCrawler:
         self._storage_stats["failed"] += 1
         logger.error("Не удалось сохранить %s (попыток: %d): %s", url, attempts, error)
 
+    def _confirm_written(self) -> None:
+        """Переводит записи из «лежат в буфере» в «сохранены», если хранилище их уже записало."""
+        written = self.storage.saved_count
+        newly = min(written - self._confirmed_total, len(self._pending_urls))
+        self._confirmed_total = written
+        for _ in range(max(newly, 0)):
+            self._pending_urls.popleft()
+        self._storage_stats["saved"] += max(newly, 0)
+
     async def _flush_storage(self) -> None:
+        """Дописывает буфер на диск. При сбое повторяет сам flush(), как и сохранение отдельных записей.
+        Если не вышло, все записи из буфера считаются неудачными и попадают в storage_errors."""
         if self.storage is None:
             return
-        try:
-            await self.storage.flush()
-        except StorageError as error:
-            logger.error("Не удалось дописать буфер хранилища: %s", error)
+        delay = self.storage_retry_delay
+        for attempt in range(self.storage_retries + 1):
+            try:
+                await self.storage.flush()
+            except (StorageError, OSError) as error:
+                if attempt >= self.storage_retries:
+                    self._flush_failed(error, attempts=attempt + 1)
+                    return
+                self._storage_stats["retries"] += 1
+                logger.warning("Ошибка записи буфера (попытка %d из %d): %s; повтор через %.1f с",
+                               attempt + 1, self.storage_retries + 1, error, delay)
+                await asyncio.sleep(delay)
+                delay *= 2
+            else:
+                self._confirm_written()
+                return
+
+    def _flush_failed(self, error: Exception, attempts: int) -> None:
+        """Записать буфер не удалось: все его записи считаем неудачными."""
+        lost = list(self._pending_urls)
+        for url in lost:
+            self.storage_errors[url] = f"{type(error).__name__}: {error}"
+        self._lost_urls.extend(lost)
+        self._pending_urls.clear()
+        self._storage_stats["failed"] += len(lost)
+        logger.error("Не удалось записать буфер хранилища (записей: %d, попыток: %d): %s",
+                     len(lost), attempts, error)
+
+    def _recover_lost(self) -> None:
+        """Если при закрытии хранилище всё-таки записало «потерянный» буфер, исправляем статистику."""
+        n = len(self._lost_urls)
+        for url in self._lost_urls:
+            self.storage_errors.pop(url, None)
+        self._lost_urls = []
+        self._storage_stats["failed"] -= n
+        self._storage_stats["saved"] += n
+        self._confirmed_total = self.storage.saved_count
+        logger.info("Буфер хранилища удалось записать при закрытии: записей %d", n)
 
     def get_storage_stats(self) -> dict:
         """Сколько страниц сохранено, сколько не удалось, сколько было повторов записи."""
         if self.storage is None:
             return {}
-        return {**self._storage_stats, "errors": dict(self.storage_errors), "storage": self.storage.get_stats()}
+        return {**self._storage_stats, "pending": len(self._pending_urls),
+                "errors": dict(self.storage_errors), "storage": self.storage.get_stats()}
 
     def _record_failure(self, url: str, reason: str) -> None:
         self.failed_urls[url] = reason
